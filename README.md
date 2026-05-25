@@ -124,7 +124,7 @@ For each product:
 - `recurring` is the monthly sum of calculated `recurrent_revenue`;
 - `base = new + recurring`;
 - `y-o-y = base - YYYY fact`;
-- `y-o-y, % = (base - YYYY fact) / base * 100`;
+- `y-o-y, % = (base - YYYY fact) / YYYY fact * 100`;
 - `total plan = YYYY fact * 1.25`;
 - `action = total plan - base`.
 
