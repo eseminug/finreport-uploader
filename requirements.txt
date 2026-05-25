@@ -8,3 +8,4 @@ lz4==4.4.5
 urllib3==2.7.0
 zstandard==0.25.0
 python-dotenv==1.2.2
+streamlit==1.57.0

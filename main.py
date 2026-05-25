@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import mimetypes
+import os
+import sys
+import uuid
+from html.parser import HTMLParser
+from http.cookiejar import CookieJar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -18,6 +26,9 @@ GROWTH_FACTOR = 1.04
 TOTAL_PLAN_FACTOR = 1.25
 WEB_RECURRENT_NEW_FACTOR = 0.6399
 WEB_RECURRENT_REC_FACTOR = 0.7487
+WSM_BASE_URL = "https://analytics.wsmgroup.ru"
+WSM_UPLOAD_PATH = "/financial-plan/update"
+WSM_LOGIN_PATH = "/login_check"
 
 
 @dataclass(frozen=True)
@@ -222,7 +233,7 @@ def build_report(month: date, output_dir: Path) -> tuple[Path, Path]:
                 "recurring": recurring,
                 "base": base,
                 "y-o-y": yoy,
-                "y-o-y, %": 0.0 if base == 0 else yoy / base * 100,
+                "y-o-y, %": 0.0 if base == 0 else yoy / previous_fact * 100,
                 "action": previous_fact * TOTAL_PLAN_FACTOR - base,
                 "total plan": previous_fact * TOTAL_PLAN_FACTOR,
             }
@@ -268,15 +279,232 @@ def build_report(month: date, output_dir: Path) -> tuple[Path, Path]:
     return daily_path, summary_path
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Build daily revenue plan for selected month.")
-    parser.add_argument("month", type=parse_month, help="Analyzed month as YYYY-MM-DD, for example 2026-06-01.")
-    parser.add_argument("--output-dir", type=Path, default=Path("output"), help="Directory for generated CSV files.")
-    args = parser.parse_args()
+def get_required_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"{name} must be set in environment or .env.")
+    return value
 
-    daily_path, summary_path = build_report(args.month, args.output_dir)
-    print(f"Daily report: {daily_path}")
-    print(f"Summary report: {summary_path}")
+
+def wsm_url(path: str) -> str:
+    return f"{WSM_BASE_URL}{path}"
+
+
+def build_wsm_opener():
+    jar = CookieJar()
+    opener = build_opener(HTTPCookieProcessor(jar))
+    return opener
+
+
+def wsm_request(url: str, data: bytes | None = None, headers: dict[str, str] | None = None, method: str | None = None) -> Request:
+    request_headers = {"User-Agent": "Mozilla/5.0"}
+    if headers:
+        request_headers.update(headers)
+    return Request(url, data=data, headers=request_headers, method=method)
+
+
+def login_to_wsmgroup():
+    username = get_required_env("WS_GROUP_USER")
+    password = get_required_env("WS_GROUP_PASSWORD")
+    opener = build_wsm_opener()
+
+    opener.open(wsm_request(wsm_url(WSM_UPLOAD_PATH)), timeout=20).read()
+    login_data = urlencode({"_username": username, "_password": password}).encode()
+    response = opener.open(
+        wsm_request(
+            wsm_url(WSM_LOGIN_PATH),
+            data=login_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        ),
+        timeout=30,
+    )
+    response.read()
+
+    if response.geturl().endswith("/login"):
+        raise RuntimeError("WSM login failed: server returned the login page.")
+
+    return opener
+
+
+def encode_multipart_formdata(fields: dict[str, str], files: dict[str, Path]) -> tuple[bytes, str]:
+    boundary = f"----finreport-uploader-{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+
+    for name, value in fields.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                str(value).encode(),
+                b"\r\n",
+            ]
+        )
+
+    for name, path in files.items():
+        filename = path.name
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode(),
+                f"Content-Type: {content_type}\r\n\r\n".encode(),
+                path.read_bytes(),
+                b"\r\n",
+            ]
+        )
+
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks), boundary
+
+
+def decode_response_body(response, body: bytes) -> str:
+    content_type = response.headers.get("content-type", "")
+    charset = "utf-8"
+    for part in content_type.split(";"):
+        part = part.strip()
+        if part.lower().startswith("charset="):
+            charset = part.split("=", 1)[1]
+            break
+    return body.decode(charset, "replace")
+
+
+class UploadResponseParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen_submit = False
+        self.collect_depth = 0
+        self.messages: list[str] = []
+        self.current: list[str] = []
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        attrs = dict(attrs)
+        if tag in {"script", "style"}:
+            self.skip_depth += 1
+            return
+
+        if tag == "input" and attrs.get("type") == "submit" and attrs.get("value") == "Обновить план":
+            self.seen_submit = True
+            return
+
+        if self.seen_submit and tag in {"td", "div", "p", "li"}:
+            self.collect_depth += 1
+            self.current = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"} and self.skip_depth:
+            self.skip_depth -= 1
+            return
+
+        if self.collect_depth and tag in {"td", "div", "p", "li"}:
+            text = " ".join(" ".join(self.current).split())
+            if text:
+                self.messages.append(text)
+            self.collect_depth -= 1
+            self.current = []
+
+    def handle_data(self, data: str) -> None:
+        if self.skip_depth or not self.collect_depth:
+            return
+        text = data.strip()
+        if text:
+            self.current.append(text)
+
+
+class VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.skip_depth = 0
+        self.text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in {"script", "style"}:
+            self.skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"} and self.skip_depth:
+            self.skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self.skip_depth:
+            return
+        text = " ".join(data.split())
+        if text:
+            self.text.append(text)
+
+
+def extract_upload_message(html: str) -> str:
+    parser = UploadResponseParser()
+    parser.feed(html)
+    if parser.messages:
+        return "\n".join(parser.messages)
+
+    fallback = VisibleTextParser()
+    fallback.feed(html)
+    return "\n".join(fallback.text)
+
+
+def upload_financial_plan(file_path: Path) -> str:
+    if not file_path.is_file():
+        raise FileNotFoundError(f"Plan file does not exist: {file_path}")
+
+    opener = login_to_wsmgroup()
+    body, boundary = encode_multipart_formdata(fields={}, files={"plan": file_path})
+    response = opener.open(
+        wsm_request(
+            wsm_url(WSM_UPLOAD_PATH),
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        ),
+        timeout=120,
+    )
+    response_body = response.read()
+    return extract_upload_message(decode_response_body(response, response_body))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Build and upload daily revenue plans.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    generate_parser = subparsers.add_parser("generate", help="Build daily and summary CSV files.")
+    generate_parser.add_argument("month", type=parse_month, help="Analyzed month as YYYY-MM-DD, for example 2026-06-01.")
+    generate_parser.add_argument("--output-dir", type=Path, default=Path("output"), help="Directory for generated CSV files.")
+
+    upload_parser = subparsers.add_parser("upload-plan", help="Upload a daily plan CSV to WSM Analytics.")
+    upload_parser.add_argument("file", type=Path, help="Path to the plan CSV file, for example output/daily_revenue_plan_2026-07.csv.")
+
+    return parser
+
+
+def normalize_legacy_args(argv: list[str]) -> list[str]:
+    commands = {"generate", "upload-plan"}
+    if argv and argv[0] not in commands and argv[0] not in {"-h", "--help"}:
+        return ["generate", *argv]
+    return argv
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args(normalize_legacy_args(sys.argv[1:]))
+
+    try:
+        if args.command == "upload-plan":
+            response_body = upload_financial_plan(args.file)
+            print(response_body)
+            return
+
+        if args.command != "generate":
+            parser.print_help()
+            return
+
+        daily_path, summary_path = build_report(args.month, args.output_dir)
+        print(f"Daily report: {daily_path}")
+        print(f"Summary report: {summary_path}")
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

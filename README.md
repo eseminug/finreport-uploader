@@ -13,12 +13,22 @@ CLICKHOUSE_HOST=...
 CLICKHOUSE_PORT=8443
 CLICKHOUSE_USERNAME=...
 CLICKHOUSE_PASSWORD=...
+WS_GROUP_USER=...
+WS_GROUP_PASSWORD=...
 ```
 
 ## Usage
 
+Build a plan:
+
 ```bash
 .venv/bin/python main.py 2026-06-01 --output-dir output
+```
+
+The legacy command above is equivalent to:
+
+```bash
+.venv/bin/python main.py generate 2026-06-01 --output-dir output
 ```
 
 The month argument must be the first day of the analyzed month in `YYYY-MM-DD` format. For example, `2026-06-01` builds the plan for June 2026.
@@ -27,6 +37,14 @@ The script writes two semicolon-separated CSV files:
 
 - `daily_revenue_plan_YYYY-MM.csv`
 - `summary_revenue_plan_YYYY-MM.csv`
+
+Upload a generated daily plan to WSM Analytics:
+
+```bash
+.venv/bin/python main.py upload-plan output/daily_revenue_plan_2026-07.csv
+```
+
+The upload command logs in to `https://analytics.wsmgroup.ru` with `WS_GROUP_USER` and `WS_GROUP_PASSWORD`, opens `/financial-plan/update`, submits the file as the `plan` multipart field, leaves `general_plan` unchecked, waits for the server response, and prints that response to stdout.
 
 ## Data Window
 
