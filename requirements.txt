@@ -1,0 +1,10 @@
+numpy==2.4.6
+pandas==3.0.3
+python-dateutil==2.9.0.post0
+six==1.17.0
+certifi==2026.5.20
+clickhouse_connect==1.0.1
+lz4==4.4.5
+urllib3==2.7.0
+zstandard==0.25.0
+python-dotenv==1.2.2
